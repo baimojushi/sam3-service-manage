@@ -1,0 +1,75 @@
+# Large data files
+*.npy
+*.pth
+*.pt
+*.safetensors
+*.bin
+*.zip
+*.whl
+*.exe
+
+# Model weights
+/mnt/e/models/
+/opt/molink/app/.venv_hf/
+
+# Output directories
+/tmp/
+*.log
+*.out
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# WSL/Windows paths
+/mnt/c/
+/mnt/wslg/
+
+# Large generated files
+VTfkn7WT4NEZ_review_package*.zip
+e4_geometry.npy
+unity6_releases.json
+numpy-*.whl
+cuda_*.exe
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Node modules
+node_modules/
+
+# Coverage data
+coverage_gt/
+coverage_gt_manifest.json
+
+# SIBR viewer
+SIBR_viewer/
+SIBR_viewer.zip
+
+# Work directories
+work/
+GaussianStitcher_V1/
+GaussianStitcher_V1_Patch*/
+
+# Scaniverse
+scaniverse_pipeline/
+展厅扫描件/
+
+# Temporary
+test_*.txt
+verify.txt
+debug.txt
+*.bak
+*.sh.bak
