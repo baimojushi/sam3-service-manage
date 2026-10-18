@@ -1,0 +1,37 @@
+{
+  "project": "SAM3 Video Service v4",
+  "assessment_scope": "GPU-free mock integration + true TCP/WebSocket transport",
+  "source_archive": "sam3-service-manage-master.zip",
+  "source_archive_sha256": "04d3cc2df82b76419fa4c10a4c7b3f9ca18b8c95140f8fc18b8d8eeaa683d532",
+  "tests": {
+    "asgi_unit_integration": 25,
+    "asgi_failures": 0,
+    "real_network_three_frame_test": "PASS",
+    "python_syntax": "PASS",
+    "shell_syntax": "PASS"
+  },
+  "implemented": {
+    "model_startup_loading": "PASS (background lifespan task; ready false until complete)",
+    "predictor_reuse": "PASS (mock)",
+    "batch_real_input_frame_cap": "PASS (FFmpeg+FFprobe mock model)",
+    "incremental_ws_protocol": "PASS (mock backend + actual websocket network)",
+    "local_auth_and_origin_gate": "PASS (mock integration)",
+    "model_thread_mutex_and_admission": "IMPLEMENTED",
+    "bounded_upload_and_frames": "PASS (mock integration)",
+    "session_finally_cleanup": "PASS (mock integration)",
+    "cuda_oom_circuit_breaker": "IMPLEMENTED"
+  },
+  "not_yet_verified": {
+    "native_sam31_gpu_boot": "needs user WSL/Molink-Infer",
+    "hf_sam3_video_model_real_gpu_boot": "needs distinct Transformers-compatible model",
+    "400_frame_brush_iou_v4": "pending on real predictor",
+    "20fps_real_time": "not claimed",
+    "long_running_gpu_memory": "pending",
+    "native_sam31_incremental_add_frame": "unsupported in Meta request dispatcher"
+  },
+  "backend_semantics": {
+    "meta": "whole uploaded video, original SAM3.1 checkpoint",
+    "hf": "true stateful incremental, different pretrained model compatibility"
+  },
+  "generated_utc": "2026-10-17T06:20:50.654304+00:00"
+}
