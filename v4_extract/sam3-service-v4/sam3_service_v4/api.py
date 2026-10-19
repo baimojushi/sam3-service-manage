@@ -15,9 +15,9 @@ import threading
 import time
 import uuid
 import zipfile
-from urllib.parse import urlsplit
 from contextlib import asynccontextmanager, closing
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -27,6 +27,8 @@ from starlette.websockets import WebSocketDisconnect
 
 from .backends import HFIncrementalBackend, MetaBatchBackend
 from .core import FrameMasks, Settings, is_local_client
+from .model_pool import ModelPool, get_global_pool, shutdown_global_pool
+from .workers import BatchWorker, StreamWorker, SingleWorker
 
 log = logging.getLogger("sam3.service")
 CHUNK = 1024 * 1024
@@ -54,7 +56,6 @@ def ffprobe_count(path: str, timeout_s: float = 30.0) -> int:
 
 
 def probe_video(path: str, timeout_s: float = 30.0) -> tuple[int, int, int]:
-    """Independent video frame count + resolution, fail closed on bad metadata."""
     cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
            "-count_frames", "-show_entries",
            "stream=nb_read_frames,width,height", "-of", "json", path]
@@ -79,7 +80,6 @@ def probe_video(path: str, timeout_s: float = 30.0) -> tuple[int, int, int]:
 
 def prepare_video(source: str, output: str, original_frames: int,
                   max_frames: int | None, stride: int, cfg: Settings) -> tuple[str, int]:
-    """Produce an actual physically bounded video; never just truncate response indices."""
     available = (original_frames + stride - 1) // stride
     requested = max_frames if max_frames is not None else available
     if requested > available:
@@ -125,7 +125,7 @@ def decode_image(raw: bytes, cfg: Settings) -> Image.Image:
 
 def _safe_browser_origin(origin: str | None) -> bool:
     if origin is None:
-        return True  # Native CLI/curl clients generally send no Origin.
+        return True
     try:
         parsed = urlsplit(origin)
         return parsed.scheme in ("http", "https") and is_local_client(parsed.hostname) or (
@@ -158,103 +158,21 @@ def _verify_ws_auth(ws: WebSocket, cfg: Settings) -> bool:
     )
 
 
-def _batch_infer(backend, cfg: Settings, video_file: str, prompt: str,
-                 threshold: float, actual_frames: int, stride: int,
-                 include_masks: bool, source_sha256: str) -> tuple[bytes | dict, str]:
-    metadata = []
-    object_ids: set[int] = set()
-    frames_with_masks = 0
-    buffer = io.BytesIO() if include_masks else None
-    z = zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) if buffer is not None else None
-
-    try:
-        with closing(backend.segment_video(video_file, prompt, threshold)) as stream:
-            for frame in stream:
-                expected_idx = len(metadata)
-                if frame.frame_index != expected_idx:
-                    raise ValueError(
-                        f"SAM3 frame index gap or duplicate: expected {expected_idx}, got {frame.frame_index}"
-                    )
-                if expected_idx >= actual_frames:
-                    raise ValueError("SAM3 returned more frames than the preprocessed video")
-                if len(frame.object_ids) > cfg.max_objects:
-                    raise ValueError("Object count exceeds safety limit")
-                row = frame.as_json(include_masks=False)
-                row["source_frame_index"] = expected_idx * stride
-                metadata.append(row)
-                any_mask = False
-                if z is not None:
-                    for oid, score, mask in zip(frame.object_ids, frame.scores, frame.masks):
-                        pixels = int(np.count_nonzero(mask))
-                        if not pixels:
-                            continue
-                        any_mask = True
-                        object_ids.add(oid)
-                        img = Image.fromarray(mask.astype(np.uint8) * 255)
-                        img_data = io.BytesIO()
-                        img.save(img_data, format="PNG")
-                        z.writestr(
-                            f"frame_{expected_idx:04d}_obj_{oid:02d}_score{score:.4f}.png",
-                            img_data.getvalue(),
-                        )
-                else:
-                    for oid, mask in zip(frame.object_ids, frame.masks):
-                        if np.any(mask):
-                            any_mask = True
-                            object_ids.add(oid)
-                if any_mask:
-                    frames_with_masks += 1
-                if buffer is not None and buffer.tell() > cfg.max_output_bytes:
-                    raise ValueError("Predicted masks ZIP exceeds max_output_bytes")
-        if len(metadata) != actual_frames:
-            raise ValueError(
-                f"Model returned {len(metadata)} frames but input has {actual_frames}"
-            )
-        seed = metadata[0]
-        result = {
-            "success": True, "backend": backend.name, "num_frames": len(metadata),
-            "num_objects": len(object_ids), "object_ids": sorted(object_ids),
-            "frames_with_masks": frames_with_masks,
-            "text_prompt": prompt, "source_sha256": source_sha256,
-            "frame_indices": [r["source_frame_index"] for r in metadata],
-            "processed_frame_indices": [r["frame_index"] for r in metadata],
-            "object_scores": [
-                (r["objects"][0]["score"] if r["objects"] else None) for r in metadata
-            ],
-            "prompt_frame": {
-                "obj_ids": [o["object_id"] for o in seed["objects"]],
-                "scores": [o["score"] for o in seed["objects"]],
-            },
-            "frame_results": metadata,
-            "output_prob_thresh": threshold,
-        }
-        if z is not None:
-            z.writestr("meta.json", json.dumps(result, ensure_ascii=False, indent=2))
-            z.close()
-            z = None
-            if buffer.tell() > cfg.max_output_bytes:
-                raise ValueError("Predicted masks ZIP exceeds output cap")
-            return buffer.getvalue(), "application/zip"
-        return result, "application/json"
-    finally:
-        if z is not None:
-            z.close()
-
-
 class Runtime:
-    def __init__(self, cfg: Settings, backend_factory=None):
+    def __init__(self, cfg: Settings):
         self.cfg = cfg
-        self.backend_factory = backend_factory or (
-            lambda conf: MetaBatchBackend(conf) if conf.engine == "meta"
-            else HFIncrementalBackend(conf)
-        )
-        self.backend = None
-        self.loading_error: str | None = None
         self.status = "starting"
+        self.loading_error: str | None = None
         self.loading_task: asyncio.Task | None = None
+        self.device_lock = threading.Lock()
         self.gate = asyncio.Lock()
-        self.device_lock = threading.Lock()  # remains held even if an asyncio waiter is cancelled
         self.active_sessions = 0
+
+        # Model pool (shared across workers)
+        self.pool: ModelPool | None = None
+        self.batch_worker: BatchWorker | None = None
+        self.stream_worker: StreamWorker | None = None
+        self.single_worker: SingleWorker | None = None
 
     def gpu_call(self, fn, *args):
         with self.device_lock:
@@ -264,12 +182,28 @@ class Runtime:
         self.status = "loading"
         started = time.perf_counter()
         try:
-            backend = self.backend_factory(self.cfg)
-            await asyncio.to_thread(self.gpu_call, backend.load)
-            self.backend = backend
+            # Initialize shared model pool
+            self.pool = get_global_pool(
+                model_path=self.cfg.model_path,
+                dtype=self.cfg.hf_dtype,
+                device=self.cfg.device,
+                pool_size=2,
+                hf_model=self.cfg.hf_model,
+                bpe_path=self.cfg.bpe_path,
+            )
+
+            # Initialize workers
+            self.batch_worker = BatchWorker(self.cfg, self.pool)
+            self.stream_worker = StreamWorker(self.cfg, self.pool)
+            self.single_worker = SingleWorker(self.cfg, self.pool)
+
+            # Load all workers
+            await asyncio.to_thread(self.batch_worker.load)
+            await asyncio.to_thread(self.stream_worker.load)
+            await asyncio.to_thread(self.single_worker.load)
+
             self.status = "ready"
-            log.info("model_load_done backend=%s elapsed_s=%.2f",
-                     backend.name, time.perf_counter() - started)
+            log.info("model_load_done elapsed_s=%.2f", time.perf_counter() - started)
         except Exception as exc:
             self.status = "error"
             self.loading_error = f"{type(exc).__name__}: {exc}"
@@ -278,12 +212,18 @@ class Runtime:
     async def shutdown(self):
         if self.loading_task:
             await self.loading_task
-        if self.backend is not None:
-            await asyncio.to_thread(self.gpu_call, self.backend.shutdown)
+        # Shutdown workers
+        if self.batch_worker:
+            await asyncio.to_thread(self.batch_worker.shutdown)
+        if self.stream_worker:
+            await asyncio.to_thread(self.stream_worker.shutdown)
+        if self.single_worker:
+            await asyncio.to_thread(self.single_worker.shutdown)
+        # Shutdown global pool
+        shutdown_global_pool()
         self.status = "stopped"
 
     def mark_runtime_error(self, exc: BaseException):
-        # CUDA OOM often leaves the predictor in a fragile state.
         if "out of memory" in str(exc).lower() or "cuda oom" in str(exc).lower():
             self.status = "degraded"
             self.loading_error = "GPUOutOfMemory: operator restart required"
@@ -302,14 +242,13 @@ class Runtime:
         self.gate.release()
 
 
-def create_app(settings: Settings | None = None, backend_factory=None) -> FastAPI:
+def create_app(settings: Settings | None = None) -> FastAPI:
     cfg = settings or Settings.from_env()
     cfg.validate()
-    rt = Runtime(cfg, backend_factory)
+    rt = Runtime(cfg)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Uvicorn can listen while the model warms up. /health/ready stays 503.
         rt.loading_task = asyncio.create_task(rt.load_at_startup())
         try:
             yield
@@ -329,8 +268,8 @@ def create_app(settings: Settings | None = None, backend_factory=None) -> FastAP
             return JSONResponse({"status": rt.status,
                                   "error_type": rt.loading_error.split(":", 1)[0] if rt.loading_error else None,
                                  "backend": cfg.engine}, status_code=503)
-        return {"status": "ready", "backend": rt.backend.name,
-                "streaming_input": rt.backend.supports_streaming}
+        return {"status": "ready", "backend": "hf-pool",
+                "streaming_input": rt.stream_worker is not None}
 
     @app.get("/health")
     def legacy_health():
@@ -339,20 +278,17 @@ def create_app(settings: Settings | None = None, backend_factory=None) -> FastAP
 
     @app.get("/v1/capabilities")
     def capabilities():
-        return {"backend": cfg.engine, "ready": rt.status == "ready",
-                "whole_video_upload": True,
-                "true_incremental_streaming": bool(
-                    rt.backend is not None and rt.backend.supports_streaming
-                ),
-                "requires_separate_hf_checkpoint": cfg.engine == "hf",
+        return {"backend": "hf-pool", "ready": rt.status == "ready",
+                "modes": ["batch", "stream", "single"],
                 "max_frames": cfg.max_frames}
 
-    @app.post("/video/segment")
-    @app.post("/v1/video/segment")
-    async def video_segment(
+    # Unified /v1/segment endpoint with mode routing
+    @app.post("/v1/segment")
+    async def unified_segment(
         request: Request,
         file: UploadFile = File(...),
         text_prompt: str = Form(...),
+        mode: str = Form("batch"),  # batch | stream | single
         frame_stride: int = Form(1),
         max_frames: int | None = Form(None),
         return_masks_png: bool = Form(False),
@@ -364,6 +300,8 @@ def create_app(settings: Settings | None = None, backend_factory=None) -> FastAP
             raise HTTPException(503, f"Model not ready ({rt.status})")
         if not text_prompt.strip() or len(text_prompt) > 256:
             raise HTTPException(422, "Invalid text prompt")
+        if mode not in ("batch", "stream", "single"):
+            raise HTTPException(422, "mode must be batch|stream|single")
         if frame_stride < 1 or frame_stride > 100:
             raise HTTPException(422, "frame_stride must be 1..100")
         if max_frames is not None and not (1 <= max_frames <= cfg.max_frames):
@@ -371,9 +309,22 @@ def create_app(settings: Settings | None = None, backend_factory=None) -> FastAP
         threshold = cfg.output_threshold if output_prob_thresh is None else output_prob_thresh
         if not 0 <= threshold <= 1:
             raise HTTPException(422, "output_prob_thresh must be 0..1")
+
+        # Route to appropriate worker
+        if mode == "batch":
+            return await _handle_batch_mode(rt, cfg, file, text_prompt, threshold,
+                                            frame_stride, max_frames, return_masks_png)
+        elif mode == "stream":
+            return await _handle_stream_mode(rt, cfg, file, text_prompt, threshold,
+                                             max_frames, return_masks_png)
+        else:  # single
+            return await _handle_single_mode(rt, cfg, file, text_prompt, threshold)
+
+    async def _handle_batch_mode(rt: Runtime, cfg: Settings, file: UploadFile,
+                                 prompt: str, threshold: float, stride: int,
+                                 max_frames: int | None, include_masks: bool):
         if not await rt.acquire():
             raise HTTPException(429, "GPU busy; retry later")
-
         try:
             import hashlib
             with tempfile.TemporaryDirectory(prefix="sam3_v4_") as folder:
@@ -392,25 +343,27 @@ def create_app(settings: Settings | None = None, backend_factory=None) -> FastAP
                         target.write(data)
                 if not length:
                     raise HTTPException(422, "Empty video upload")
-                try:
-                    original_count, width, height = await asyncio.to_thread(probe_video, path)
-                    if width * height > cfg.max_frame_pixels:
-                        raise ValueError("Video resolution exceeds max_frame_pixels")
-                    sampled_available = (original_count + frame_stride - 1) // frame_stride
-                    if max_frames is None and sampled_available > cfg.max_frames:
-                        raise ValueError(
-                            "Video exceeds the max_frames safety cap; supply max_frames explicitly"
-                        )
-                    source, count = await asyncio.to_thread(
-                        prepare_video, path, os.path.join(folder, "sampled.mp4"),
-                        original_count, max_frames, frame_stride, cfg
+                original_count, width, height = await asyncio.to_thread(probe_video, path)
+                if width * height > cfg.max_frame_pixels:
+                    raise ValueError("Video resolution exceeds max_frame_pixels")
+                sampled_available = (original_count + stride - 1) // stride
+                if max_frames is None and sampled_available > cfg.max_frames:
+                    raise ValueError(
+                        "Video exceeds max_frames safety cap; supply max_frames explicitly"
                     )
-                except (ValueError, NotEnoughFrames) as exc:
-                    raise HTTPException(422, str(exc))
+                source, count = await asyncio.to_thread(
+                    prepare_video, path, os.path.join(folder, "sampled.mp4"),
+                    original_count, max_frames, stride, cfg
+                )
                 started = time.perf_counter()
-                result, content_type = await asyncio.to_thread(
-                    rt.gpu_call, _batch_infer, rt.backend, cfg, source, text_prompt.strip(),
-                    threshold, count, frame_stride, return_masks_png, sha.hexdigest(),
+                result, content_type = await rt.batch_worker.segment_video(
+                    video_path=source,
+                    prompt=prompt.strip(),
+                    threshold=threshold,
+                    actual_frames=count,
+                    stride=stride,
+                    include_masks=include_masks,
+                    source_sha256=sha.hexdigest(),
                 )
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
                 if content_type == "application/zip":
@@ -429,6 +382,55 @@ def create_app(settings: Settings | None = None, backend_factory=None) -> FastAP
         finally:
             rt.release()
 
+    async def _handle_stream_mode(rt: Runtime, cfg: Settings, file: UploadFile,
+                                  prompt: str, threshold: float,
+                                  max_frames: int | None, include_masks: bool):
+        # Stream mode expects WebSocket connection, not file upload
+        # This endpoint is for backward compatibility - redirect to WS
+        raise HTTPException(400, "Stream mode requires WebSocket connection at /v1/video/stream")
+
+    async def _handle_single_mode(rt: Runtime, cfg: Settings, file: UploadFile,
+                                  prompt: str, threshold: float):
+        if not await rt.acquire():
+            raise HTTPException(429, "GPU busy; retry later")
+        try:
+            image = decode_image(await file.read(), cfg)
+            started = time.perf_counter()
+            result = await rt.single_worker.segment_single(image, prompt.strip(), threshold)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            return JSONResponse({
+                "success": True,
+                "backend": "hf-pool-single",
+                "inference_ms": elapsed_ms,
+                "frame_result": result.as_json(include_masks=True)
+            })
+        except HTTPException:
+            raise
+        except Exception as exc:
+            rt.mark_runtime_error(exc)
+            log.exception("SAM3 single inference failed")
+            raise HTTPException(500, "SAM3 single inference failed; see server logs")
+        finally:
+            rt.release()
+
+    # Legacy /video/segment endpoint (batch only, for backward compatibility)
+    @app.post("/video/segment")
+    @app.post("/v1/video/segment")
+    async def video_segment_legacy(
+        request: Request,
+        file: UploadFile = File(...),
+        text_prompt: str = Form(...),
+        frame_stride: int = Form(1),
+        max_frames: int | None = Form(None),
+        return_masks_png: bool = Form(False),
+        output_prob_thresh: float | None = Form(None),
+        authorization: str | None = Header(None),
+    ):
+        return await _handle_batch_mode(rt, cfg, file, text_prompt,
+                                        cfg.output_threshold if output_prob_thresh is None else output_prob_thresh,
+                                        frame_stride, max_frames, return_masks_png)
+
+    # WebSocket streaming endpoint
     @app.websocket("/video/stream")
     @app.websocket("/v1/video/stream")
     async def video_stream(ws: WebSocket):
@@ -441,9 +443,9 @@ def create_app(settings: Settings | None = None, backend_factory=None) -> FastAP
             await ws.send_json({"type": "error", "code": "NOT_READY", "state": rt.status})
             await ws.close(code=1013)
             return
-        if not rt.backend.supports_streaming:
-            await ws.send_json({"type": "error", "code": "UNSUPPORTED_BACKEND",
-                                "message": "Meta batch predictor has no add_frame API; use SAM3_ENGINE=hf"})
+        if rt.stream_worker is None:
+            await ws.send_json({"type": "error", "code": "UNSUPPORTED",
+                                "message": "Stream worker not available"})
             await ws.close(code=1003)
             return
         if not await rt.acquire():
@@ -451,9 +453,7 @@ def create_app(settings: Settings | None = None, backend_factory=None) -> FastAP
             await ws.close(code=1013)
             return
 
-        session = None
-        start_time = time.monotonic()
-        session_id = str(uuid.uuid4())
+        session_id = None
         expected_idx = 0
         last_source_timestamp = None
         pending_metadata = None
@@ -473,13 +473,16 @@ def create_app(settings: Settings | None = None, backend_factory=None) -> FastAP
             include_masks = init.get("return_masks_png", True)
             if not isinstance(include_masks, bool):
                 raise ValueError("return_masks_png must be boolean")
-            session = await asyncio.to_thread(rt.gpu_call, rt.backend.new_stream, prompt.strip())
+
+            # Create session via StreamWorker
+            session_id = await rt.stream_worker.create_session(prompt.strip(), threshold, max_frames)
             await ws.send_json({"type": "ready", "session_id": session_id,
-                                "backend": rt.backend.name,
+                                "backend": "hf-pool-stream",
                                 "frame_format": ["JPEG", "PNG"],
                                 "next_frame_index": 0,
                                 "ack_required": True,
                                 "max_frames": max_frames})
+
             dimensions = None
             while expected_idx < max_frames:
                 if time.monotonic() - start_time > cfg.max_session_s:
@@ -525,11 +528,8 @@ def create_app(settings: Settings | None = None, backend_factory=None) -> FastAP
                 elif dimensions != image.size:
                     raise ValueError("Frame resolution changed during session")
                 inference_start = time.perf_counter()
-                result = await asyncio.to_thread(
-                    rt.gpu_call, rt.backend.process_frame, session, image, threshold
-                )
+                result = await rt.stream_worker.process_frame(session_id, image)
                 inference_ms = (time.perf_counter() - inference_start) * 1000.0
-                result.frame_index = expected_idx
                 output = result.as_json(
                     include_masks=include_masks,
                     max_mask_bytes=min(cfg.max_frame_bytes, cfg.max_output_bytes),
@@ -572,9 +572,9 @@ def create_app(settings: Settings | None = None, backend_factory=None) -> FastAP
             except (RuntimeError, WebSocketDisconnect):
                 pass
         finally:
-            if session is not None:
+            if session_id:
                 try:
-                    await asyncio.to_thread(rt.gpu_call, rt.backend.close_stream, session)
+                    await rt.stream_worker.end_session(session_id)
                 except Exception:
                     log.exception("Failed to free streaming session state")
             rt.release()
